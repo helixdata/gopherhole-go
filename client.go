@@ -1,0 +1,1354 @@
+package gopherhole
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/gorilla/websocket"
+)
+
+const (
+	DefaultHubURL = "wss://hub.gopherhole.ai/ws"
+	DefaultAPIURL = "https://hub.gopherhole.ai"
+)
+
+// ClientOption configures a Client.
+type ClientOption func(*Client)
+
+// WithHubURL sets a custom hub WebSocket URL.
+func WithHubURL(url string) ClientOption {
+	return func(c *Client) {
+		c.hubURL = url
+	}
+}
+
+// WithAPIURL sets a custom API URL.
+func WithAPIURL(url string) ClientOption {
+	return func(c *Client) {
+		c.apiURL = url
+	}
+}
+
+// WithAutoReconnect enables/disables auto-reconnection.
+func WithAutoReconnect(enabled bool) ClientOption {
+	return func(c *Client) {
+		c.autoReconnect = enabled
+	}
+}
+
+// WithReconnectDelay sets the initial reconnect delay.
+func WithReconnectDelay(d time.Duration) ClientOption {
+	return func(c *Client) {
+		c.reconnectDelay = d
+	}
+}
+
+// WithMaxReconnectAttempts sets the maximum reconnection attempts (0 = infinite).
+func WithMaxReconnectAttempts(n int) ClientOption {
+	return func(c *Client) {
+		c.maxReconnectAttempts = n
+	}
+}
+
+// WithMaxReconnectDelay sets the maximum delay between reconnection attempts (caps exponential backoff).
+func WithMaxReconnectDelay(d time.Duration) ClientOption {
+	return func(c *Client) {
+		c.maxReconnectDelay = d
+	}
+}
+
+// WithHTTPClient sets a custom HTTP client.
+func WithHTTPClient(hc *http.Client) ClientOption {
+	return func(c *Client) {
+		c.httpClient = hc
+	}
+}
+
+// WithRequestTimeout sets the default request timeout.
+func WithRequestTimeout(d time.Duration) ClientOption {
+	return func(c *Client) {
+		c.requestTimeout = d
+	}
+}
+
+// WithTransport sets the transport mode (http, ws, auto). Default is auto.
+func WithTransport(mode TransportMode) ClientOption {
+	return func(c *Client) {
+		c.transportMode = mode
+	}
+}
+
+// WithWSFallback enables HTTP fallback when WebSocket is not connected (ws mode only).
+func WithWSFallback(enabled bool) ClientOption {
+	return func(c *Client) {
+		c.wsFallback = enabled
+	}
+}
+
+// WithAgentCard sets the agent card to register on connect.
+func WithAgentCard(card *AgentCard) ClientOption {
+	return func(c *Client) {
+		c.agentCard = card
+	}
+}
+
+// WithWelcomeTimeout bounds how long Connect() waits for the hub's welcome
+// message (which carries the agent ID) before giving up. Default: 10 seconds.
+func WithWelcomeTimeout(d time.Duration) ClientOption {
+	return func(c *Client) {
+		c.welcomeTimeout = d
+	}
+}
+
+// MessageHandler is called when a message is received.
+type MessageHandler func(Message)
+
+// SystemHandler is called when a verified system message is received from @system.
+type SystemHandler func(Message)
+
+// TaskUpdateHandler is called when a task is updated.
+type TaskUpdateHandler func(Task)
+
+// ErrorHandler is called when an error occurs.
+type ErrorHandler func(error)
+
+// ReconnectingHandler is called when a reconnection attempt is scheduled.
+type ReconnectingHandler func(attempt int, delay time.Duration)
+
+// Client is a GopherHole SDK client.
+type Client struct {
+	apiKey               string
+	hubURL               string
+	apiURL               string
+	autoReconnect        bool
+	reconnectDelay       time.Duration
+	maxReconnectDelay    time.Duration
+	maxReconnectAttempts int
+	requestTimeout       time.Duration
+	httpClient           *http.Client
+	agentCard            *AgentCard
+	transportMode        TransportMode
+	wsFallback           bool
+
+	// Transport layer
+	transport   Transport
+	wsTransport *wsTransport
+
+	// WebSocket state
+	conn              *websocket.Conn
+	connMu            sync.RWMutex
+	connected         atomic.Bool
+	agentID           string
+	reconnectAttempts int
+
+	// welcomeCh is created per Connect() call and closed once the
+	// hub's welcome message (carrying agentID) has been processed — or
+	// when readLoop exits without a welcome, so Connect() unblocks either
+	// way. welcomeMu protects re-init / close races.
+	welcomeCh chan struct{}
+	welcomeMu sync.Mutex
+
+	// welcomeTimeout bounds how long Connect() will wait for the welcome
+	// message before giving up and tearing down the connection.
+	welcomeTimeout time.Duration
+
+	// Event handlers
+	onMessage      MessageHandler
+	onSystem       SystemHandler
+	onTaskUpdate   TaskUpdateHandler
+	onError        ErrorHandler
+	onConnect      func()
+	onDisconnect   func(reason string)
+	onReconnecting ReconnectingHandler
+
+	// Lifecycle
+	ctx        context.Context
+	cancel     context.CancelFunc
+	done       chan struct{}
+	rpcCounter atomic.Int64
+}
+
+// New creates a new GopherHole client.
+func New(apiKey string, opts ...ClientOption) *Client {
+	c := &Client{
+		apiKey:               apiKey,
+		hubURL:               DefaultHubURL,
+		apiURL:               DefaultAPIURL,
+		autoReconnect:        true,
+		reconnectDelay:       time.Second,
+		maxReconnectDelay:    5 * time.Minute,
+		maxReconnectAttempts: 0, // 0 = infinite
+		requestTimeout:       30 * time.Second,
+		transportMode:        TransportAuto,
+		wsFallback:           true,
+		done:                 make(chan struct{}),
+		welcomeTimeout:       10 * time.Second,
+	}
+
+	for _, opt := range opts {
+		opt(c)
+	}
+
+	// Set HTTP client timeout from requestTimeout
+	if c.httpClient == nil {
+		c.httpClient = &http.Client{Timeout: c.requestTimeout}
+	}
+
+	// Derive API URL from hub URL if not explicitly set
+	if c.apiURL == DefaultAPIURL && c.hubURL != DefaultHubURL {
+		c.apiURL = strings.Replace(c.hubURL, "/ws", "", 1)
+		c.apiURL = strings.Replace(c.apiURL, "wss://", "https://", 1)
+		c.apiURL = strings.Replace(c.apiURL, "ws://", "http://", 1)
+	}
+
+	// Initialize transport based on mode
+	switch c.transportMode {
+	case TransportWS:
+		wst := newWSTransport(
+			func() *websocket.Conn { return c.conn },
+			&c.connMu,
+			c.requestTimeout,
+			c.wsFallback,
+			c.apiURL, c.apiKey, c.httpClient,
+		)
+		c.wsTransport = wst
+		c.transport = wst
+	case TransportHTTP:
+		c.transport = newHTTPTransport(c.apiURL, c.apiKey, c.httpClient, c.requestTimeout)
+	default: // auto
+		c.transport = newHTTPTransport(c.apiURL, c.apiKey, c.httpClient, c.requestTimeout)
+	}
+
+	return c
+}
+
+// OnMessage sets the handler for incoming messages.
+func (c *Client) OnMessage(h MessageHandler) {
+	c.onMessage = h
+}
+
+// OnSystem sets the handler for verified system messages from @system.
+func (c *Client) OnSystem(h SystemHandler) {
+	c.onSystem = h
+}
+
+// IsSystemMessage checks if a message is a verified system message.
+func (c *Client) IsSystemMessage(msg Message) bool {
+	return msg.IsSystemMessage()
+}
+
+// OnTaskUpdate sets the handler for task updates.
+func (c *Client) OnTaskUpdate(h TaskUpdateHandler) {
+	c.onTaskUpdate = h
+}
+
+// OnError sets the handler for errors.
+func (c *Client) OnError(h ErrorHandler) {
+	c.onError = h
+}
+
+// OnConnect sets the handler for connection events.
+func (c *Client) OnConnect(h func()) {
+	c.onConnect = h
+}
+
+// OnDisconnect sets the handler for disconnection events.
+func (c *Client) OnDisconnect(h func(reason string)) {
+	c.onDisconnect = h
+}
+
+// OnReconnecting sets the handler for reconnection attempts.
+func (c *Client) OnReconnecting(h ReconnectingHandler) {
+	c.onReconnecting = h
+}
+
+// Connect establishes a WebSocket connection to the hub.
+// For TransportHTTP mode, this is a no-op since all RPC goes over HTTP.
+func (c *Client) Connect(ctx context.Context) error {
+	if c.transportMode == TransportHTTP {
+		c.ctx, c.cancel = context.WithCancel(ctx)
+		c.connected.Store(true)
+		if c.onConnect != nil {
+			c.onConnect()
+		}
+		return nil
+	}
+
+	c.ctx, c.cancel = context.WithCancel(ctx)
+
+	header := http.Header{}
+	header.Set("Authorization", "Bearer "+c.apiKey)
+
+	dialer := websocket.Dialer{
+		HandshakeTimeout: 10 * time.Second,
+	}
+
+	conn, _, err := dialer.DialContext(c.ctx, c.hubURL, header)
+	if err != nil {
+		return fmt.Errorf("websocket dial: %w", err)
+	}
+
+	// Reset welcome signal channel for this connect attempt
+	c.welcomeMu.Lock()
+	c.welcomeCh = make(chan struct{})
+	welcomeCh := c.welcomeCh
+	c.welcomeMu.Unlock()
+
+	c.connMu.Lock()
+	c.conn = conn
+	c.connMu.Unlock()
+	c.connected.Store(true)
+	c.reconnectAttempts = 0
+
+	// Start message reader
+	go c.readLoop()
+
+	// Start ping loop
+	go c.pingLoop()
+
+	// Block until the hub sends the welcome message so that AgentID() is
+	// populated by the time Connect() returns. readLoop signals the same
+	// channel on early exit, so we never hang indefinitely.
+	welcomeTimeout := c.welcomeTimeout
+	if welcomeTimeout <= 0 {
+		welcomeTimeout = 10 * time.Second
+	}
+	select {
+	case <-welcomeCh:
+		// welcome received (or readLoop exited) — check which
+		if c.agentID == "" {
+			c.Disconnect()
+			return fmt.Errorf("connection closed before welcome received")
+		}
+	case <-time.After(welcomeTimeout):
+		c.Disconnect()
+		return fmt.Errorf("timed out waiting for welcome from hub after %s", welcomeTimeout)
+	case <-ctx.Done():
+		c.Disconnect()
+		return ctx.Err()
+	}
+
+	if c.onConnect != nil {
+		c.onConnect()
+	}
+
+	return nil
+}
+
+// signalWelcome closes the current welcome channel (idempotent). Called
+// both from the welcome handler and from readLoop's defer.
+func (c *Client) signalWelcome() {
+	c.welcomeMu.Lock()
+	defer c.welcomeMu.Unlock()
+	if c.welcomeCh == nil {
+		return
+	}
+	select {
+	case <-c.welcomeCh:
+		// already closed
+	default:
+		close(c.welcomeCh)
+	}
+}
+
+// Disconnect closes the WebSocket connection.
+func (c *Client) Disconnect() {
+	c.autoReconnect = false
+	if c.cancel != nil {
+		c.cancel()
+	}
+	if c.wsTransport != nil {
+		c.wsTransport.Cleanup()
+	}
+	c.connMu.Lock()
+	if c.conn != nil {
+		c.conn.Close()
+		c.conn = nil
+	}
+	c.connMu.Unlock()
+	c.connected.Store(false)
+}
+
+// Connected returns true if the client is connected.
+func (c *Client) Connected() bool {
+	return c.connected.Load()
+}
+
+// AgentID returns the agent ID (available after connect).
+func (c *Client) AgentID() string {
+	return c.agentID
+}
+
+// Wait blocks until the client disconnects.
+func (c *Client) Wait() {
+	<-c.done
+}
+
+// Send sends a message to another agent.
+func (c *Client) Send(ctx context.Context, toAgentID string, payload MessagePayload, opts *SendOptions) (*Task, error) {
+	params := map[string]interface{}{
+		"message": payload,
+		"configuration": map[string]interface{}{
+			"agentId": toAgentID,
+		},
+	}
+
+	if opts != nil {
+		config := params["configuration"].(map[string]interface{})
+		if opts.ContextID != "" {
+			config["contextId"] = opts.ContextID
+		}
+		if opts.PushNotificationURL != "" {
+			config["pushNotificationUrl"] = opts.PushNotificationURL
+		}
+		if opts.HistoryLength > 0 {
+			config["historyLength"] = opts.HistoryLength
+		}
+		if opts.TTL != nil {
+			config["x-ttl"] = *opts.TTL
+		}
+		if opts.Secrets != nil && len(opts.Secrets) > 0 {
+			config["x-gopherhole-secrets"] = opts.Secrets
+		}
+	}
+
+	var task Task
+	if err := c.rpc(ctx, "SendMessage", params, &task); err != nil {
+		return nil, err
+	}
+	return &task, nil
+}
+
+// SendText sends a text message to another agent.
+func (c *Client) SendText(ctx context.Context, toAgentID, text string, opts *SendOptions) (*Task, error) {
+	return c.Send(ctx, toAgentID, MessagePayload{
+		Role:  RoleAgent,
+		Parts: []MessagePart{TextPart(text)},
+	}, opts)
+}
+
+// SendTextAndWait sends a text message and waits for completion.
+func (c *Client) SendTextAndWait(ctx context.Context, toAgentID, text string, opts *SendOptions, waitOpts *WaitOptions) (*Task, error) {
+	task, err := c.SendText(ctx, toAgentID, text, opts)
+	if err != nil {
+		return nil, err
+	}
+	return c.WaitForTask(ctx, task.ID, waitOpts)
+}
+
+// AskText sends a text message and returns the response text.
+// This is the simplest way to interact with another agent - it handles
+// all the polling and response extraction automatically.
+func (c *Client) AskText(ctx context.Context, toAgentID, text string, opts *SendOptions, waitOpts *WaitOptions) (string, error) {
+	task, err := c.SendTextAndWait(ctx, toAgentID, text, opts, waitOpts)
+	if err != nil {
+		return "", err
+	}
+	if task.Status.State == TaskStateFailed {
+		msg := task.Status.Message
+		if msg == "" {
+			msg = "task failed"
+		}
+		return "", errors.New(msg)
+	}
+	return task.GetResponseText(), nil
+}
+
+// WaitOptions configures the WaitForTask behavior.
+type WaitOptions struct {
+	// PollInterval is the time between polls (default 1s).
+	PollInterval time.Duration
+	// MaxWait is the maximum wait time (default 5 min).
+	MaxWait time.Duration
+}
+
+// WaitForTask polls a task until it reaches a terminal state.
+func (c *Client) WaitForTask(ctx context.Context, taskID string, opts *WaitOptions) (*Task, error) {
+	pollInterval := time.Second
+	maxWait := 5 * time.Minute
+
+	if opts != nil {
+		if opts.PollInterval > 0 {
+			pollInterval = opts.PollInterval
+		}
+		if opts.MaxWait > 0 {
+			maxWait = opts.MaxWait
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, maxWait)
+	defer cancel()
+
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	for {
+		task, err := c.GetTask(ctx, taskID, 0)
+		if err != nil {
+			return nil, err
+		}
+
+		switch task.Status.State {
+		case "completed", "failed", "canceled", "rejected":
+			return task, nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("task %s did not complete within %v", taskID, maxWait)
+		case <-ticker.C:
+			// Continue polling
+		}
+	}
+}
+
+// UpdateCard updates the agent card (sends to hub if connected).
+func (c *Client) UpdateCard(card *AgentCard) error {
+	c.agentCard = card
+	c.connMu.RLock()
+	conn := c.conn
+	c.connMu.RUnlock()
+	if conn != nil {
+		cardMsg := map[string]interface{}{
+			"type":      "update_card",
+			"agentCard": card,
+		}
+		return conn.WriteJSON(cardMsg)
+	}
+	return nil
+}
+
+// GetTask retrieves a task by ID.
+func (c *Client) GetTask(ctx context.Context, taskID string, historyLength int) (*Task, error) {
+	params := map[string]interface{}{
+		"id": taskID,
+	}
+	if historyLength > 0 {
+		params["historyLength"] = historyLength
+	}
+
+	var task Task
+	if err := c.rpc(ctx, "GetTask", params, &task); err != nil {
+		return nil, err
+	}
+	return &task, nil
+}
+
+// ListTasksOptions configures the ListTasks call.
+type ListTasksOptions struct {
+	ContextID string
+	Status    string // Filter by state, e.g. "submitted" for queued tasks
+	PageSize  int
+	PageToken string
+}
+
+// ListTasksResult contains the paginated task list.
+type ListTasksResult struct {
+	Tasks         []Task `json:"tasks"`
+	NextPageToken string `json:"nextPageToken,omitempty"`
+	TotalSize     int    `json:"totalSize"`
+}
+
+// ListTasks returns tasks, optionally filtered by context or status.
+func (c *Client) ListTasks(ctx context.Context, opts *ListTasksOptions) (*ListTasksResult, error) {
+	params := map[string]interface{}{}
+	if opts != nil {
+		if opts.ContextID != "" {
+			params["contextId"] = opts.ContextID
+		}
+		if opts.Status != "" {
+			params["status"] = opts.Status
+		}
+		if opts.PageSize > 0 {
+			params["pageSize"] = opts.PageSize
+		}
+		if opts.PageToken != "" {
+			params["pageToken"] = opts.PageToken
+		}
+	}
+
+	var result ListTasksResult
+	if err := c.rpc(ctx, "ListTasks", params, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// CancelTask cancels a task.
+func (c *Client) CancelTask(ctx context.Context, taskID string) (*Task, error) {
+	params := map[string]interface{}{
+		"id": taskID,
+	}
+
+	var task Task
+	if err := c.rpc(ctx, "CancelTask", params, &task); err != nil {
+		return nil, err
+	}
+	return &task, nil
+}
+
+// Reply sends a reply to an existing task.
+func (c *Client) Reply(ctx context.Context, taskID string, payload MessagePayload) (*Task, error) {
+	// Get the task to find context
+	task, err := c.GetTask(ctx, taskID, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	params := map[string]interface{}{
+		"message": payload,
+		"configuration": map[string]interface{}{
+			"contextId": task.ContextID,
+		},
+	}
+
+	var result Task
+	if err := c.rpc(ctx, "SendMessage", params, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// ReplyText sends a text reply to an existing task.
+func (c *Client) ReplyText(ctx context.Context, taskID, text string) (*Task, error) {
+	return c.Reply(ctx, taskID, MessagePayload{
+		Role:  RoleAgent,
+		Parts: []MessagePart{TextPart(text)},
+	})
+}
+
+// Discover searches for public agents.
+func (c *Client) Discover(ctx context.Context, opts *DiscoverOptions) (*DiscoverResult, error) {
+	params := url.Values{}
+	if opts != nil {
+		if opts.Query != "" {
+			params.Set("q", opts.Query)
+		}
+		if opts.Category != "" {
+			params.Set("category", opts.Category)
+		}
+		if opts.Tag != "" {
+			params.Set("tag", opts.Tag)
+		}
+		if opts.SkillTag != "" {
+			params.Set("skillTag", opts.SkillTag)
+		}
+		if opts.ContentMode != "" {
+			params.Set("contentMode", opts.ContentMode)
+		}
+		if opts.Sort != "" {
+			params.Set("sort", opts.Sort)
+		}
+		if opts.Limit > 0 {
+			params.Set("limit", strconv.Itoa(opts.Limit))
+		}
+		if opts.Offset > 0 {
+			params.Set("offset", strconv.Itoa(opts.Offset))
+		}
+	}
+
+	endpoint := c.apiURL + "/api/discover/agents"
+	if len(params) > 0 {
+		endpoint += "?" + params.Encode()
+	}
+
+	var result DiscoverResult
+	if err := c.httpGet(ctx, endpoint, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// SearchAgents searches for agents by query.
+func (c *Client) SearchAgents(ctx context.Context, query string, opts *DiscoverOptions) (*DiscoverResult, error) {
+	if opts == nil {
+		opts = &DiscoverOptions{}
+	}
+	opts.Query = query
+	return c.Discover(ctx, opts)
+}
+
+// GetTopRated returns top-rated agents.
+func (c *Client) GetTopRated(ctx context.Context, limit int) (*DiscoverResult, error) {
+	return c.Discover(ctx, &DiscoverOptions{Sort: "rating", Limit: limit})
+}
+
+// GetPopular returns popular agents.
+func (c *Client) GetPopular(ctx context.Context, limit int) (*DiscoverResult, error) {
+	return c.Discover(ctx, &DiscoverOptions{Sort: "popular", Limit: limit})
+}
+
+// FindBySkillTag finds agents by skill tag (searches within agent skills).
+func (c *Client) FindBySkillTag(ctx context.Context, skillTag string, opts *DiscoverOptions) (*DiscoverResult, error) {
+	if opts == nil {
+		opts = &DiscoverOptions{}
+	}
+	opts.SkillTag = skillTag
+	return c.Discover(ctx, opts)
+}
+
+// FindByContentMode finds agents that support a specific input/output mode.
+func (c *Client) FindByContentMode(ctx context.Context, mode string, opts *DiscoverOptions) (*DiscoverResult, error) {
+	if opts == nil {
+		opts = &DiscoverOptions{}
+	}
+	opts.ContentMode = mode
+	return c.Discover(ctx, opts)
+}
+
+// GetCategories returns available agent categories.
+func (c *Client) GetCategories(ctx context.Context) ([]AgentCategory, error) {
+	var result struct {
+		Categories []AgentCategory `json:"categories"`
+	}
+	if err := c.httpGet(ctx, c.apiURL+"/api/discover/categories", &result); err != nil {
+		return nil, err
+	}
+	return result.Categories, nil
+}
+
+// GetAgentInfo returns detailed information about an agent.
+func (c *Client) GetAgentInfo(ctx context.Context, agentID string) (*AgentInfo, error) {
+	var result AgentInfo
+	if err := c.httpGet(ctx, c.apiURL+"/api/discover/agents/"+agentID, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// RateAgent rates an agent.
+func (c *Client) RateAgent(ctx context.Context, agentID string, rating int, review string) error {
+	body := map[string]interface{}{
+		"rating": rating,
+	}
+	if review != "" {
+		body["review"] = review
+	}
+
+	return c.httpPost(ctx, c.apiURL+"/api/discover/agents/"+agentID+"/rate", body, nil)
+}
+
+// ============================================================
+// WORKSPACE METHODS (GopherHole Extension)
+// ============================================================
+
+// WorkspaceCreate creates a new workspace.
+func (c *Client) WorkspaceCreate(ctx context.Context, name, description string) (*Workspace, error) {
+	params := map[string]interface{}{
+		"name":        name,
+		"description": description,
+	}
+	var result struct {
+		Workspace Workspace `json:"workspace"`
+	}
+	if err := c.rpc(ctx, "x-gopherhole/workspace.create", params, &result); err != nil {
+		return nil, err
+	}
+	return &result.Workspace, nil
+}
+
+// WorkspaceGet retrieves a workspace by ID.
+func (c *Client) WorkspaceGet(ctx context.Context, workspaceID string) (*Workspace, error) {
+	params := map[string]string{"workspace_id": workspaceID}
+	var result struct {
+		Workspace Workspace `json:"workspace"`
+	}
+	if err := c.rpc(ctx, "x-gopherhole/workspace.get", params, &result); err != nil {
+		return nil, err
+	}
+	return &result.Workspace, nil
+}
+
+// WorkspaceDelete deletes a workspace (must be owner).
+func (c *Client) WorkspaceDelete(ctx context.Context, workspaceID string) error {
+	params := map[string]string{"workspace_id": workspaceID}
+	return c.rpc(ctx, "x-gopherhole/workspace.delete", params, nil)
+}
+
+// WorkspaceList lists workspaces this agent is a member of.
+func (c *Client) WorkspaceList(ctx context.Context) ([]Workspace, error) {
+	var result struct {
+		Workspaces []Workspace `json:"workspaces"`
+	}
+	if err := c.rpc(ctx, "x-gopherhole/workspace.list", map[string]interface{}{}, &result); err != nil {
+		return nil, err
+	}
+	return result.Workspaces, nil
+}
+
+// WorkspaceMembersAdd adds an agent to a workspace (admin only).
+func (c *Client) WorkspaceMembersAdd(ctx context.Context, workspaceID, agentID string, role WorkspaceRole) error {
+	params := map[string]interface{}{
+		"workspace_id": workspaceID,
+		"agent_id":     agentID,
+		"role":         role,
+	}
+	return c.rpc(ctx, "x-gopherhole/workspace.members.add", params, nil)
+}
+
+// WorkspaceMembersRemove removes an agent from a workspace (admin only).
+func (c *Client) WorkspaceMembersRemove(ctx context.Context, workspaceID, agentID string) error {
+	params := map[string]interface{}{
+		"workspace_id": workspaceID,
+		"agent_id":     agentID,
+	}
+	return c.rpc(ctx, "x-gopherhole/workspace.members.remove", params, nil)
+}
+
+// WorkspaceMembersList lists workspace members.
+func (c *Client) WorkspaceMembersList(ctx context.Context, workspaceID string) ([]WorkspaceMember, error) {
+	params := map[string]string{"workspace_id": workspaceID}
+	var result struct {
+		Members []WorkspaceMember `json:"members"`
+	}
+	if err := c.rpc(ctx, "x-gopherhole/workspace.members.list", params, &result); err != nil {
+		return nil, err
+	}
+	return result.Members, nil
+}
+
+// WorkspaceStore stores a memory in a workspace.
+func (c *Client) WorkspaceStore(ctx context.Context, params WorkspaceStoreParams) (*WorkspaceMemory, error) {
+	var result struct {
+		Memory WorkspaceMemory `json:"memory"`
+	}
+	if err := c.rpc(ctx, "x-gopherhole/workspace.store", params, &result); err != nil {
+		return nil, err
+	}
+	return &result.Memory, nil
+}
+
+// WorkspaceQuery queries workspace memories using semantic search.
+func (c *Client) WorkspaceQuery(ctx context.Context, params WorkspaceQueryParams) ([]WorkspaceMemory, error) {
+	var result struct {
+		Memories []WorkspaceMemory `json:"memories"`
+		Count    int               `json:"count"`
+	}
+	if err := c.rpc(ctx, "x-gopherhole/workspace.query", params, &result); err != nil {
+		return nil, err
+	}
+	return result.Memories, nil
+}
+
+// WorkspaceUpdate updates an existing memory.
+func (c *Client) WorkspaceUpdate(ctx context.Context, params WorkspaceUpdateParams) (*WorkspaceMemory, error) {
+	var result struct {
+		Memory WorkspaceMemory `json:"memory"`
+	}
+	if err := c.rpc(ctx, "x-gopherhole/workspace.update", params, &result); err != nil {
+		return nil, err
+	}
+	return &result.Memory, nil
+}
+
+// WorkspaceForget deletes memories by ID or semantic query.
+func (c *Client) WorkspaceForget(ctx context.Context, workspaceID string, memoryID string, query string) (int, error) {
+	params := map[string]interface{}{"workspace_id": workspaceID}
+	if memoryID != "" {
+		params["id"] = memoryID
+	}
+	if query != "" {
+		params["query"] = query
+	}
+	var result struct {
+		Deleted int `json:"deleted"`
+	}
+	if err := c.rpc(ctx, "x-gopherhole/workspace.forget", params, &result); err != nil {
+		return 0, err
+	}
+	return result.Deleted, nil
+}
+
+// WorkspaceMemories lists memories in a workspace (non-semantic browse).
+func (c *Client) WorkspaceMemories(ctx context.Context, params WorkspaceListMemoriesParams) (*WorkspaceMemoriesResult, error) {
+	var result WorkspaceMemoriesResult
+	if err := c.rpc(ctx, "x-gopherhole/workspace.memories", params, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// WorkspaceTypes returns available memory types.
+func (c *Client) WorkspaceTypes(ctx context.Context) ([]MemoryType, error) {
+	var result struct {
+		Types []struct {
+			ID string `json:"id"`
+		} `json:"types"`
+	}
+	if err := c.rpc(ctx, "x-gopherhole/workspace.types", map[string]interface{}{}, &result); err != nil {
+		return nil, err
+	}
+	types := make([]MemoryType, len(result.Types))
+	for i, t := range result.Types {
+		types[i] = MemoryType(t.ID)
+	}
+	return types, nil
+}
+
+// WorkspaceSecretsSet stores a secret in a workspace.
+func (c *Client) WorkspaceSecretsSet(ctx context.Context, workspaceID, key, value string) error {
+	params := map[string]interface{}{
+		"workspace_id": workspaceID,
+		"key":          key,
+		"value":        value,
+	}
+	return c.rpc(ctx, "x-gopherhole/workspace.secrets.set", params, nil)
+}
+
+// WorkspaceSecretsGet retrieves a secret value from a workspace.
+func (c *Client) WorkspaceSecretsGet(ctx context.Context, workspaceID, key string) (string, error) {
+	params := map[string]interface{}{
+		"workspace_id": workspaceID,
+		"key":          key,
+	}
+	var result struct {
+		Key   string `json:"key"`
+		Value string `json:"value"`
+	}
+	if err := c.rpc(ctx, "x-gopherhole/workspace.secrets.get", params, &result); err != nil {
+		return "", err
+	}
+	return result.Value, nil
+}
+
+// WorkspaceSecretsDelete deletes a secret from a workspace.
+func (c *Client) WorkspaceSecretsDelete(ctx context.Context, workspaceID, key string) error {
+	params := map[string]interface{}{
+		"workspace_id": workspaceID,
+		"key":          key,
+	}
+	return c.rpc(ctx, "x-gopherhole/workspace.secrets.delete", params, nil)
+}
+
+// WorkspaceSecretsList lists secrets in a workspace (keys only, no values).
+func (c *Client) WorkspaceSecretsList(ctx context.Context, workspaceID string) ([]SecretInfo, error) {
+	params := map[string]interface{}{
+		"workspace_id": workspaceID,
+	}
+	var result struct {
+		Secrets []SecretInfo `json:"secrets"`
+	}
+	if err := c.rpc(ctx, "x-gopherhole/workspace.secrets.list", params, &result); err != nil {
+		return nil, err
+	}
+	return result.Secrets, nil
+}
+
+// Discovery methods (GopherHole extension)
+
+// ListAvailableAgentsOptions configures the ListAvailableAgents call.
+type ListAvailableAgentsOptions struct {
+	Query         string `json:"query,omitempty"`
+	IncludePublic bool   `json:"public,omitempty"`
+}
+
+// AvailableAgent represents an agent you can communicate with.
+type AvailableAgent struct {
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Description string `json:"description,omitempty"`
+	TenantName string `json:"tenantName"`
+	TenantSlug string `json:"tenantSlug"`
+	Verified   bool   `json:"verified"`
+	AccessType string `json:"accessType"` // same-tenant, granted, public
+	AutoApprove bool  `json:"autoApprove"`
+}
+
+// ListAvailableAgents returns agents you can communicate with (same-tenant + granted).
+func (c *Client) ListAvailableAgents(ctx context.Context, opts *ListAvailableAgentsOptions) ([]AvailableAgent, error) {
+	params := map[string]interface{}{}
+	if opts != nil {
+		if opts.Query != "" {
+			params["query"] = opts.Query
+		}
+		if opts.IncludePublic {
+			params["public"] = true
+		}
+	}
+	
+	var result struct {
+		Agents []AvailableAgent `json:"agents"`
+	}
+	if err := c.rpc(ctx, "x-gopherhole/agents.available", params, &result); err != nil {
+		return nil, err
+	}
+	return result.Agents, nil
+}
+
+// DiscoverAgentsOptions configures the DiscoverAgents call.
+type DiscoverAgentsOptions struct {
+	Query        string `json:"query,omitempty"`
+	Category     string `json:"category,omitempty"`
+	Tag          string `json:"tag,omitempty"`
+	Owner        string `json:"owner,omitempty"`        // Filter by organization/tenant name
+	Organization string `json:"organization,omitempty"` // Deprecated: use Owner instead
+	Verified     *bool  `json:"verified,omitempty"`     // Only show agents from verified organizations
+	Sort         string `json:"sort,omitempty"`         // smart, rating, popular, recent
+	Limit        int    `json:"limit,omitempty"`
+	Offset       int    `json:"offset,omitempty"`
+}
+
+// DiscoveredAgent represents an agent found in the public marketplace.
+type DiscoveredAgent struct {
+	ID          string   `json:"id"`
+	Name        string   `json:"name"`
+	Description string   `json:"description,omitempty"`
+	Category    string   `json:"category,omitempty"`
+	Tags        []string `json:"tags"`
+	Pricing     string   `json:"pricing"`
+	TenantName  string   `json:"tenantName"`
+	TenantSlug  string   `json:"tenantSlug"`
+	Verified    bool     `json:"verified"`
+	Featured    bool     `json:"featured"`
+	AvgRating   float64  `json:"avgRating"`
+	RatingCount int      `json:"ratingCount"`
+	AutoApprove bool     `json:"autoApprove"`
+	WebsiteURL  string   `json:"websiteUrl,omitempty"`
+	DocsURL     string   `json:"docsUrl,omitempty"`
+}
+
+// DiscoverAgentsResult contains the discovered agents and pagination info.
+type DiscoverAgentsResult struct {
+	Agents []DiscoveredAgent `json:"agents"`
+	Count  int               `json:"count"`
+	Offset int               `json:"offset"`
+}
+
+// DiscoverAgents searches the public marketplace with smart scoring.
+func (c *Client) DiscoverAgents(ctx context.Context, opts *DiscoverAgentsOptions) (*DiscoverAgentsResult, error) {
+	params := map[string]interface{}{}
+	if opts != nil {
+		if opts.Query != "" {
+			params["query"] = opts.Query
+		}
+		if opts.Category != "" {
+			params["category"] = opts.Category
+		}
+		if opts.Tag != "" {
+			params["tag"] = opts.Tag
+		}
+		// Use Owner, fall back to Organization for backwards compatibility
+		owner := opts.Owner
+		if owner == "" {
+			owner = opts.Organization
+		}
+		if owner != "" {
+			params["owner"] = owner
+		}
+		if opts.Verified != nil {
+			params["verified"] = *opts.Verified
+		}
+		if opts.Sort != "" {
+			params["sort"] = opts.Sort
+		}
+		if opts.Limit > 0 {
+			params["limit"] = opts.Limit
+		}
+		if opts.Offset > 0 {
+			params["offset"] = opts.Offset
+		}
+	}
+	
+	var result DiscoverAgentsResult
+	if err := c.rpc(ctx, "x-gopherhole/agents.discover", params, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// DiscoverNearbyOptions configures the DiscoverNearby call.
+type DiscoverNearbyOptions struct {
+	Lat      float64 `json:"lat"`
+	Lng      float64 `json:"lng"`
+	Radius   float64 `json:"radius,omitempty"`
+	Tag      string  `json:"tag,omitempty"`
+	Category string  `json:"category,omitempty"`
+	Limit    int     `json:"limit,omitempty"`
+	Offset   int     `json:"offset,omitempty"`
+}
+
+// AgentLocation represents a geographic location for an agent.
+type AgentLocation struct {
+	Name    string  `json:"name"`
+	Lat     float64 `json:"lat"`
+	Lng     float64 `json:"lng"`
+	Country string  `json:"country"`
+}
+
+// NearbyAgent represents an agent with location data.
+type NearbyAgent struct {
+	DiscoveredAgent
+	Location AgentLocation `json:"location"`
+	Distance float64       `json:"distance"`
+}
+
+// DiscoverNearbyResult contains the results of a nearby agent search.
+type DiscoverNearbyResult struct {
+	Agents []NearbyAgent `json:"agents"`
+	Center struct {
+		Lat float64 `json:"lat"`
+		Lng float64 `json:"lng"`
+	} `json:"center"`
+	Radius float64 `json:"radius"`
+	Count  int     `json:"count"`
+	Offset int     `json:"offset"`
+}
+
+// DiscoverNearby searches for agents near a geographic location.
+func (c *Client) DiscoverNearby(ctx context.Context, opts *DiscoverNearbyOptions) (*DiscoverNearbyResult, error) {
+	params := map[string]interface{}{
+		"lat": opts.Lat,
+		"lng": opts.Lng,
+	}
+	if opts.Radius > 0 {
+		params["radius"] = opts.Radius
+	}
+	if opts.Tag != "" {
+		params["tag"] = opts.Tag
+	}
+	if opts.Category != "" {
+		params["category"] = opts.Category
+	}
+	if opts.Limit > 0 {
+		params["limit"] = opts.Limit
+	}
+	if opts.Offset > 0 {
+		params["offset"] = opts.Offset
+	}
+
+	var result DiscoverNearbyResult
+	if err := c.rpc(ctx, "x-gopherhole/agents.discover.nearby", params, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// RequestAccess sends an access request to a public agent.
+func (c *Client) RequestAccess(ctx context.Context, agentID string, reason string) (*AccessRequest, error) {
+	body := map[string]interface{}{}
+	if reason != "" {
+		body["reason"] = reason
+	}
+
+	var result AccessRequest
+	if err := c.httpPost(ctx, c.apiURL+"/api/discover/agents/"+agentID+"/request-access", body, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// Internal methods
+
+func (c *Client) rpc(ctx context.Context, method string, params interface{}, result interface{}) error {
+	return c.transport.Request(ctx, method, params, result)
+}
+
+func (c *Client) httpGet(ctx context.Context, url string, result interface{}) error {
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("http %d: %s", resp.StatusCode, string(body))
+	}
+
+	return json.NewDecoder(resp.Body).Decode(result)
+}
+
+func (c *Client) httpPost(ctx context.Context, url string, body interface{}, result interface{}) error {
+	jsonBody, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(jsonBody))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("http %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	if result != nil {
+		return json.NewDecoder(resp.Body).Decode(result)
+	}
+	return nil
+}
+
+func (c *Client) readLoop() {
+	defer func() {
+		c.connected.Store(false)
+		// Unblock any Connect() still waiting on the welcome signal.
+		c.signalWelcome()
+		if c.onDisconnect != nil {
+			c.onDisconnect("connection closed")
+		}
+		c.maybeReconnect()
+		close(c.done)
+	}()
+
+	for {
+		c.connMu.RLock()
+		conn := c.conn
+		c.connMu.RUnlock()
+
+		if conn == nil {
+			return
+		}
+
+		_, data, err := conn.ReadMessage()
+		if err != nil {
+			if c.onError != nil && !errors.Is(err, websocket.ErrCloseSent) {
+				c.onError(err)
+			}
+			return
+		}
+
+		// Intercept JSON-RPC responses for wsTransport
+		if c.wsTransport != nil && c.wsTransport.HandleMessage(data) {
+			continue
+		}
+
+		var msg wsMessage
+		if err := json.Unmarshal(data, &msg); err != nil {
+			if c.onError != nil {
+				c.onError(fmt.Errorf("unmarshal ws message: %w", err))
+			}
+			continue
+		}
+
+		c.handleWSMessage(msg)
+	}
+}
+
+func (c *Client) handleWSMessage(msg wsMessage) {
+	switch msg.Type {
+	case "message":
+		var payload MessagePayload
+		if err := json.Unmarshal(msg.Payload, &payload); err == nil {
+			message := Message{
+				From:      msg.From,
+				TaskID:    msg.TaskID,
+				Payload:   payload,
+				Timestamp: time.UnixMilli(msg.Timestamp),
+				Metadata:  msg.Metadata,
+			}
+			
+			// Call system handler for verified system messages
+			if c.onSystem != nil && message.IsSystemMessage() {
+				c.onSystem(message)
+			}
+			
+			// Always call message handler for backwards compatibility
+			if c.onMessage != nil {
+				c.onMessage(message)
+			}
+		}
+	case "task_update":
+		if c.onTaskUpdate != nil && msg.Task != nil {
+			c.onTaskUpdate(*msg.Task)
+		}
+	case "welcome":
+		c.agentID = msg.AgentID
+		// Send agent card if configured
+		if c.agentCard != nil {
+			c.connMu.RLock()
+			conn := c.conn
+			c.connMu.RUnlock()
+			if conn != nil {
+				cardMsg := map[string]interface{}{
+					"type":      "update_card",
+					"agentCard": c.agentCard,
+				}
+				_ = conn.WriteJSON(cardMsg)
+			}
+		}
+		// Release Connect() now that agent identity is known.
+		c.signalWelcome()
+	case "card_updated":
+		// Agent card was successfully updated
+	case "pong":
+		// Heartbeat response, ignore
+	}
+}
+
+func (c *Client) pingLoop() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-ticker.C:
+			c.connMu.RLock()
+			conn := c.conn
+			c.connMu.RUnlock()
+
+			if conn != nil {
+				conn.WriteJSON(map[string]string{"type": "ping"})
+			}
+		}
+	}
+}
+
+func (c *Client) maybeReconnect() {
+	// Check if we should reconnect: enabled AND (infinite OR under max attempts)
+	shouldReconnect := c.autoReconnect &&
+		(c.maxReconnectAttempts == 0 || c.reconnectAttempts < c.maxReconnectAttempts)
+
+	if !shouldReconnect {
+		return
+	}
+
+	c.reconnectAttempts++
+	// Exponential backoff capped at maxReconnectDelay
+	uncappedDelay := c.reconnectDelay * time.Duration(1<<(c.reconnectAttempts-1))
+	delay := uncappedDelay
+	if delay > c.maxReconnectDelay {
+		delay = c.maxReconnectDelay
+	}
+
+	// Emit reconnecting event
+	if c.onReconnecting != nil {
+		c.onReconnecting(c.reconnectAttempts, delay)
+	}
+
+	time.AfterFunc(delay, func() {
+		if err := c.Connect(context.Background()); err != nil {
+			if c.onError != nil {
+				c.onError(fmt.Errorf("reconnect failed: %w", err))
+			}
+		}
+	})
+}
