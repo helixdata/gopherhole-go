@@ -453,3 +453,15 @@ type AccessRequest struct {
 	Status    string `json:"status"`
 	CreatedAt string `json:"created_at"`
 }
+
+// ConciergeOptions configures the Concierge convenience methods (Ask, Research, FindAgents).
+type ConciergeOptions struct {
+	// MaxCost is the maximum cost in credits for downstream agents (default: 0 = free only).
+	MaxCost float64
+	// AllowPaid enables paid agents (default: false).
+	AllowPaid bool
+	// PollInterval between status checks (default: 1s).
+	PollInterval time.Duration
+	// MaxWait is the maximum time to wait for a response (default: 2 min).
+	MaxWait time.Duration
+}

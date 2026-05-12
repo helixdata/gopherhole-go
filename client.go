@@ -740,6 +740,92 @@ func (c *Client) RateAgent(ctx context.Context, agentID string, rating int, revi
 }
 
 // ============================================================
+// CONCIERGE METHODS
+// ============================================================
+
+const conciergeID = "agent-concierge-official"
+
+// Ask sends a question to the Concierge, which routes it to the best agent.
+func (c *Client) Ask(ctx context.Context, question string, opts *ConciergeOptions) (string, error) {
+	return c.callConcierge(ctx, question, "route", opts)
+}
+
+// Research sends a complex question to the Concierge for multi-agent fan-out and synthesis.
+func (c *Client) Research(ctx context.Context, question string, opts *ConciergeOptions) (string, error) {
+	return c.callConcierge(ctx, question, "research", opts)
+}
+
+// FindAgents asks the Concierge to discover agents matching a topic or capability.
+func (c *Client) FindAgents(ctx context.Context, query string) (string, error) {
+	return c.callConcierge(ctx, query, "find", nil)
+}
+
+func (c *Client) callConcierge(ctx context.Context, text, mode string, opts *ConciergeOptions) (string, error) {
+	ghExt := map[string]interface{}{"mode": mode}
+	if opts != nil {
+		if opts.MaxCost > 0 {
+			ghExt["maxCost"] = opts.MaxCost
+		}
+		if opts.AllowPaid {
+			ghExt["allowPaid"] = true
+		}
+	}
+
+	params := map[string]interface{}{
+		"message": MessagePayload{
+			Role:  RoleUser,
+			Parts: []MessagePart{TextPart(text)},
+		},
+		"configuration": map[string]interface{}{
+			"agentId": conciergeID,
+		},
+		"x-gopherhole": ghExt,
+	}
+
+	var task Task
+	if err := c.rpc(ctx, "SendMessage", params, &task); err != nil {
+		return "", err
+	}
+
+	switch task.Status.State {
+	case TaskStateCompleted:
+		return task.GetResponseText(), nil
+	case TaskStateFailed:
+		msg := task.Status.Message
+		if msg == "" {
+			msg = "concierge request failed"
+		}
+		return "", errors.New(msg)
+	}
+
+	waitOpts := &WaitOptions{
+		PollInterval: time.Second,
+		MaxWait:      2 * time.Minute,
+	}
+	if opts != nil {
+		if opts.PollInterval > 0 {
+			waitOpts.PollInterval = opts.PollInterval
+		}
+		if opts.MaxWait > 0 {
+			waitOpts.MaxWait = opts.MaxWait
+		}
+	}
+
+	completed, err := c.WaitForTask(ctx, task.ID, waitOpts)
+	if err != nil {
+		return "", err
+	}
+	if completed.Status.State == TaskStateFailed {
+		msg := completed.Status.Message
+		if msg == "" {
+			msg = "concierge request failed"
+		}
+		return "", errors.New(msg)
+	}
+	return completed.GetResponseText(), nil
+}
+
+// ============================================================
 // WORKSPACE METHODS (GopherHole Extension)
 // ============================================================
 
